@@ -1,0 +1,25 @@
+---LMP Forecasting Codebook---
+
+Weather Parameters: 
+
+| Parameter                        | ID      | Unit          |
+|----------------------------------|---------|---------------|
+| Pressure                         | PRES    | pa            |
+| Direct Solar Irradiance          | DSWRF   | W/m2          |
+| Diffuse Solar Irradiance         | DLWRF   | W/m2          |
+| Dew Point (2m)                   | DPT_2m  | K             |
+| Relative Humidity (2m)           | RH_2m   | \%            |
+| Temperature (2m)                 | TMP_2m  | K             |
+| Wind Speed (10m)                 | WS_10m  | m/s           |
+| Wind Speed (60m)                 | WS_60m  | m/s           |
+| Wind Speed (80m)                 | WS_80m  | m/s           |
+| Wind Speed (100m)                | WS_100m | m/s           |
+| Wind Speed (120m)                | WS_120m | m/s           |
+| Discomfort Index (2m)            | DI_2m   | \%            |
+| Wind Chill (2m)                  | WC_2m   | K             |
+| Heating Cooling Degree Hour (2m) | HCDH_2m | K             | 
+| (unknown)                        | GSI     | (unknown)     |
+
+Locations:
+
+113 lat/lon combinations within ~100 miles of (34.4688, -119.8844)

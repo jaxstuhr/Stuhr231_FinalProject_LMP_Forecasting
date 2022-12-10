@@ -1,0 +1,1194 @@
+---
+title: "Predicting Locational Marginal Electricity Prices in Goleta using Machine Learning"
+author: "Jaxon Stuhr"
+date: "2022-11-18"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(reticulate)
+library(here)
+library(tidyverse)
+library(mapview)
+library(writexl)
+library(stringr)
+library(lubridate)
+library(R.utils)
+library(tidymodels)
+library(glmnet)
+library(yardstick)
+library(corrplot)
+library(ggpubr)
+# set seed for reproducibility
+set.seed(2438)
+```
+
+# Background
+
+## Introduction
+
+Local weather has always been a significant driver of electricity consumption, leading to increased heating or cooling to provide comfort from extreme temperatures. Additionally, as an ever-growing share of California's electricity is produced from renewable sources (solar + wind), the weather has begun to influence how our energy is produced as well. Balancing the supply and demand of electricity at any given time is crucial to maintaining a stable grid, however, non-renewable forms of generation often have large startup times and significant costs associated with their labor and fuel consumption. For these reasons it is immensely important to forecast both electricity supply and demand accurately at any given time at different locations throughout the State, as transmission capacity also can severely limit electricity transfer from one are to another.
+
+This relationship between spatio-temporal supply and demand is evidenced in what are called "Locational Marginal Prices" (LMPs). These are wholesale electricity prices, unique to over 5000 nodes in California, that are driven by a combination of local demand, supply, and transmission capacity. I was curious how well simple machine-learning algorithms learned in this class could do at predicting these LMPs when paired with both 1) historical LMP data and 2) NOAA weather data.
+
+## Data Procurement
+
+The first challenged I faced was developing datasets of 1) LMPs for all Nodes in California for the years 2019 - 2022 (at an hourly time-scale) and 2) Weather data for all locations in CA for (also for the years 2019-2022 at an hourly time-scale). Luckily I was put in tough with Guillermo Terren Serrano, a postdoc in Ranjit Deshmuk's CETLab at UCSB. Guille had written APIs to pull LMP data from CAISO's website and weather data from NOAA's website. He hadn't yet been able to take advantage of it yet, however, because CAISO does not publish the locations of the nodes (essentially, when one downloads the data, the data file includes *node IDs* and *LMPs*, but not the *latitude* and *longitude* associated with the *node ID)*. I was able to write a script that scraped a CAISO Map's HTML to create a crosswalk of Node IDs and node locations (lat and lon). I won't, however, be sharing the script or the Node locations as we are hoping to publish an expanded version of this work in the near future, and finding these node locations seems to be in demand. I have included a Map I made of all node locations below. Using the Node location crosswalk along with Guille's APIs, we were able to create complete datasets of NOAA weather history (15 weather parameters at 9152 locations for 3 years, hourly) and LMPs (price for over 5000 locations for 3 years, hourly).
+
+## Scope
+
+Due to time and memory limitations, this analysis will focus on predicting LMPs for a single node, rather than all nodes in CA. We plan on expanding the analysis to be able to forecast electricity prices for the entire state, however, each node will have its own unique combination of predictors (parameters and locations), so the models will need to be run independently for each node.
+
+We chose to focus on local prices, choosing the node GOLETA_6\_N200 with latitude and longitude: (34.4688 -119.8844) Additionally, we included only a subset of the weather data for our model. This will be expanded upon in the *methods* section.
+
+## Model Performance
+
+Performance of electricity forecasting models is typically compared to what's known as a *persistence* model. The *persistence* model follows the simple equation:
+
+$$
+LMP_{day, hour} = LMP_{day-1, hour}
+$$
+
+Assuming the LMP of a given day and hour is simply yesterday's price at that same hour. This is used often for electricity forecasting because the *day ahead* market's are projected 24 hours in advance, meaning that $LMP_{day-1, hour}$ data is available when market's (and electricity generation dispatch) is being planned.
+
+The key performance indicator for a model such as this is the *forecasting skill*, $\alpha$:
+
+$$
+\alpha = 1-\frac{RMSE_{model}}{RMSE_{persistence}}
+$$
+
+Thus a model with an $RMSE$ equal to that of the persistence model would score $0$, and a model with an $RMSE$ of $0$ would score $1$. $\alpha <0$ should not occur as $LMP_{day-1, hour}$ is included as a parameter in the model, so if the model cannot gain any predictive power from the weather data, it would include only $LMP_{day-1, hour}$ and score $\alpha = 0$.
+
+# Data
+
+## Raw Data
+
+The first challenge was getting all of the data into R dataframes formatted such that *tidymodels* would be able to interpret it. Guille's scripts were in python so I was provided with .pkl files of LMPS and NOAA actual hourly weather data for three years.
+
+$$
+3\:years\:*\:365\:days/year\:*\:24\:hrs/day\:=\:26280\:observations
+$$
+
+For each hour, NOAA provides data for \>9000 locations in and around CA on 15 weather parameters (all numeric) summarized in Table 1 below:
+
+| Parameter                        | ID      | Unit          |
+|----------------------------------|---------|---------------|
+| Pressure                         | PRES    | pa            |
+| Direct Solar Irradiance          | DSWRF   | W/m2          |
+| Diffuse Solar Irradiance         | DLWRF   | W/m2          |
+| Dew Point (2m)                   | DPT_2m  | K             |
+| Relative Humidity (2m)           | RH_2m   | \%            |
+| Temperature (2m)                 | TMP_2m  | K             |
+| Wind Speed (10m)                 | WS_10m  | m/s           |
+| Wind Speed (60m)                 | WS_60m  | m/s           |
+| Wind Speed (80m)                 | WS_80m  | m/s           |
+| Wind Speed (100m)                | WS_100m | m/s           |
+| Wind Speed (120m)                | WS_120m | m/s           |
+| Discomfort Index (2m)            | DI_2m   | \%            |
+| Wind Chill (2m)                  | WC_2m   | K             |
+| Heating Cooling Degree Hour (2m) | HCDH_2m | K             | 
+| (unknown)                        | GSI     | (unknown)     |
+
+: Table 1: NOAA Weather Parameters
+
+$$
+15\:parameters\:*\:9152\:locations\:=\:137280\:potential \:predictors
+$$
+
+## Filtering
+
+My hope was to run a LASSO on all 137280 predictive parameters, however, R's memory couldn't handle this. I am still working on figuring out a way to include more parameters, but to be able to carry on with the analysis, I filtered the dataset in two ways:
+
+1.  I eliminated weather observations from alternating nodes in both the X and Y directions, effectively filtering out 75% of locations
+2.  I only considered weather observations with a radius $r<r_0$ . I am currently setting up functionality to perform cross validation over a range of \$r_0\$, however, for this analysis $r_0 = 1.5\: degrees \approx 100\: miles$
+
+This filtering left me with 1695 predictors (113 locations x 15 parameters). The following code chunks carry out the data cleaning and filtering described above, and the map (Figure 1) shows the weather node locations that were considered in the final analyses. The latitude and longitude of the Goleta LMP Node is: (34.4688 -119.8844).
+
+```{r, Import-Pandas}
+# import pandas to read .pkl files into R
+pd = import("pandas")
+```
+
+```{r, Define-Paths}
+# define paths o nmy computer to LMP, weather, and land data files
+ac_lmp_files <- list.files(path="C:/Users/jzs88/Box/LMP_Predictive_Modeling/acLMPs",
+                    pattern=".pkl", 
+                    all.files=T, 
+                    full.names=T)
+ac_weather_files <- list.files(path="C:/Users/jzs88/Box/LMP_Predictive_Modeling/acWeather",
+                    pattern=".pkl", 
+                    all.files=T, 
+                    full.names=T)
+us_land_path <- "C:/Users/jzs88/Box/LMP_Predictive_Modeling/spatial_grid/USland_0.125_(-125,-112)_(32,43).pkl"
+ref_grid_path <- "C:/Users/jzs88/Box/LMP_Predictive_Modeling/spatial_grid/ref_grid_0.125_(-125,-112)_(32,43).pkl"
+```
+
+```{r, Setup-LMP-Lists}
+# initialize values for building LMP dataframe
+
+# 5 minute bins => 12 bins per hour, assuming 0-55
+lmp_minutes = 12
+# build list of LMP minutes 0, 5, 10, ..., 55
+lmp_minute_list = (0:11)*5
+lmp_hours = 24
+
+# start minute, hour counters at 0
+minute = 0
+hour = 0
+# build LMP hour list of length 288 = 12 (minute bins) x 24 (hours)
+lmp_hour_list = matrix(1, lmp_minutes*lmp_hours)
+# iterate through list
+for (i in 1:length(lmp_hour_list)) {
+  # first 12 bins have hour = 0, then 1, etc up to 23
+  if (minute < lmp_minutes) {
+    lmp_hour_list[i] = hour
+    minute = minute + 1
+  } else {
+    hour = hour + 1
+    lmp_hour_list[i] = hour
+    minute = 1
+  }
+}
+```
+
+```{r, Read-LMP-Function}
+# write a function that returns LMPs for input lists of file paths
+build_lmp_data_frame = function(file_paths) {
+  # initialize LMP data frame with column labels
+  lmp_data_frame = data.frame(matrix(nrow = 0, ncol = 7))
+  colnames(lmp_data_frame) = c("lmp", "date", "hour", "minute", "node_id", "lat", "lon") 
+  # iterate through file paths
+  for (lmp_file in file_paths) {
+    # pull out full dataset for current path, node_id, lat, lon
+    current_node_id = sub(".pkl", "", sub("C:/Users/jzs88/Box/LMP_Predictive_Modeling/acLMPs/CA_", "", lmp_file))
+    # current_lat = node_locations_no_dups$lat[match(current_node_id, node_locations_no_dups$node_id)]
+    # current_lon = node_locations_no_dups$lon[match(current_node_id, node_locations_no_dups$node_id)] 
+    # defined explicitly becuase I am no including the node_locations_crosswalk.Rmd code
+    current_lat = 34.4688 
+    current_lon = -119.8844
+    current_node_lmps = pd$read_pickle(lmp_file)
+    # iterate through all days for current node
+    for (i in 2:length(current_node_lmps)) {
+      # pull out all data for day i
+      day_data = current_node_lmps[i]
+      # pull out only LMPs for day i
+      lmps_list = c(day_data[[1]])
+      date = ymd(names(current_node_lmps[i]))
+      # build dataframe for day i LMPs
+      current_day_lmps = data.frame(
+        # values from current vectorized LMP list
+        lmp = lmps_list,
+        # date from current data
+        year = year(date),
+        month = month(date),
+        day = day(date),
+        # hour, minute from previoiusly built iterative lists
+        hour = lmp_hour_list,
+        minute = lmp_minute_list,
+        # node id, lat, lon, consistent across entire nested for loop
+        node_id = current_node_id,
+        lat = current_lat, 
+        lon = current_lon
+      ) 
+      # bind this days data to complete data frame
+      lmp_data_frame = rbind(lmp_data_frame, current_day_lmps)
+    }
+  }
+  lmp_data_frame = lmp_data_frame %>% 
+    filter(minute == 0) %>% 
+    mutate(date = ymd_h(paste(year, month, day, hour))) %>% 
+    select(-c(year, month, day, hour, minute))
+  # return entire LMP data frame
+  return(lmp_data_frame)
+}
+```
+
+```{r, Read-LMP-Data}
+current_node = "GOLETA_6_N200"
+# build goleta lmps data frame
+goleta_lmps = build_lmp_data_frame(ac_lmp_files[4]) %>% 
+  filter(node_id == current_node)# %>% 
+# build dataframe of goleta_node lat and lon
+loc_goleta = c(unique(goleta_lmps$lat), unique(goleta_lmps$lon))
+# specify max radius within which to include weather observations
+radius = 1.5
+```
+
+```{r, Map-Weather-Nodes}
+
+# read in us_land and ref_grid from pkl files
+us_land = pd$read_pickle(us_land_path)
+ref_grid = pd$read_pickle(ref_grid_path)
+
+# convert entire grid to data frame
+ref_grid = as.data.frame(ref_grid) %>%
+  rename(lon = V1,
+         lat = V2)
+
+#initialize us grid
+us_grid = ref_grid %>% 
+  mutate(land = 0)
+
+# label and filter for only points on land
+us_grid$land[1:length(us_grid$land)] = us_land
+us_grid = us_grid %>% 
+  filter(land == 1) %>% 
+  mutate(lat_lon = paste(as.character(lat), as.character(lon)))
+
+locs_in_rad = ref_grid %>% 
+  filter((lat %% .25) == 0) %>% 
+  filter((lon %% .25) == 0) %>% 
+  #filter(paste(as.character(lat), as.character(lon)) %in% us_grid$lat_lon ) %>%
+  filter( ((loc_goleta[1] - lat)^2 + (loc_goleta[2] - lon)^2)^(1/2) < radius)
+
+mapview(locs_in_rad, xcol = "lon", ycol = "lat", crs = 4269)
+```
+
+Figure 1: Map of Weather Nodes included in Analysis within \~100 miles of GOleta LMP Node
+
+```{r, Build-Weather-Lists}
+# setup crosswalk of weather parameters
+weather_params_ac = data.frame(
+  param = c("PRES",  "DSWRF", "DLWRF", "DPT_2m", "RH_2m", "TMP_2m", "WS_10m", "WS_60m", "WS_80m", "WS_100m", "WS_120m", "DI_2m", "WC_2m", "HCDH_2m", "GSI"),
+  unit = c("pa", "W/m2", "W/m2", "K", "%", "K", "m/s", "m/s", "m/s", "m/s", "m/s", "?", "K?", "degree_hour", "?")
+)
+
+hours = 24
+params = 15
+locs = 9152
+
+# build list of hours that is length 24 (hrs)
+hours_list = 0:23
+
+# build list of parameters that is length 24 (hrs) x 15 (parameters)
+hour = 0
+param_index = 1
+params_list = matrix(1, hours*params)
+for (i in 1:length(params_list)) {
+  if (hour < hours) {
+    params_list[i] = weather_params_ac$param[param_index]
+    hour = hour + 1
+  } else {
+    param_index = param_index + 1
+    params_list[i] = weather_params_ac$param[param_index]
+    hour = 1
+  }
+}
+
+# build lists of lats and lons that are length 24 (hrs) x 15 (parameters) x 9152 (locations)
+hour_params = 0
+loc_index = 1
+lat_list = matrix(1, hours*params*locs)
+lon_list = matrix(1, hours*params*locs)
+for (i in 1:length(lat_list)) {
+  if (hour_params < hours*params) {
+    lat_list[i] = ref_grid$lat[loc_index]
+    lon_list[i] = ref_grid$lon[loc_index]
+    hour_params = hour_params + 1
+  } else {
+    loc_index = loc_index + 1
+    lat_list[i] = ref_grid$lat[loc_index]
+    lon_list[i] = ref_grid$lon[loc_index]
+    hour_params = 1
+  }
+}
+```
+
+```{r, Read-Weather-Files}
+# create function to build dataframe from list of files paths, list of dates, and variable lists
+build_weather_data_frame = function(file_paths) {
+
+  # initialize complete weathere data frame
+  weather_data_frame = data.frame(matrix(nrow = 0, ncol = 137284))
+  colnames(weather_data_frame) = c("value", "year", "month", "day", "hour", "parameter", "lat", "lon")
+  
+  # iterate through file paths provided
+  for (i in 1:length(file_paths)) {
+    # print which path code is on no check run speed
+    print(i)
+    flush.console()
+    # read in vectorized weather data from current file path
+    weather_list = c(pd$read_pickle(file_paths[i]))
+    date = ymd(str_sub(sub(".pkl", "", file_paths[i]), -8, -1))
+    # build new data frame of current weather data
+    current_weather = data.frame(
+      # values from current vectorized weather list
+      value = weather_list,
+      year = year(date),
+      month = month(date),
+      day = day(date),
+      # hour, parameter, lat, lon from previoiusly built iterative lists
+      hour = hours_list,
+      parameter = params_list,
+      lat = lat_list, 
+      lon = lon_list
+      ) %>% 
+      # skip every other land loc in both directions (25% of total locations)
+      filter((lat %% .25) == 0) %>% 
+      filter((lon %% .25) == 0) %>% 
+      # filter out weather data for locations w/ euclidean distance > radius specified above
+      filter( ((loc_goleta[1] - lat)^2 + (loc_goleta[2] - lon)^2)^(1/2) < radius) %>%
+      # expand data to include an individual covariate for each parameter at each location
+      pivot_wider(names_from = c(parameter, lat, lon), values_from = value, names_sep = "//")
+    # append current weather data to complete data frame
+    weather_data_frame = rbind(weather_data_frame, current_weather) 
+  }
+  weather_data_frame = weather_data_frame %>% 
+      mutate(date = ymd_h(paste(year, month, day, hour))) %>% 
+      select(-c(year, month, day, hour))
+  # return data frame with weather from all files and dates provided
+  return(weather_data_frame)
+}
+```
+
+``` {#r}
+# build weather data for given radius if not already saved as RDS file
+weather_1 = build_weather_data_frame(ac_weather_files[1:200])
+weather_2 = build_weather_data_frame(ac_weather_files[201:400])
+weather_3 = build_weather_data_frame(ac_weather_files[401:600])
+weather_4 = build_weather_data_frame(ac_weather_files[601:800])
+weather_5 = build_weather_data_frame(ac_weather_files[801:1000])
+weather_6 = build_weather_data_frame(ac_weather_files[1001:1095])
+all_weather = rbind(weather_1, weather_2, weather_3, weather_4, weather_5, weather_6)
+
+# save weather as RDS file all_weather_r_"radius"_w_"number of weather days".rds
+saveRDS(all_weather, file = here("outputs", "all_weather_r_2_w_1095.rds"))
+```
+
+    # read in weather file for radius = 0.8, first 656 weather files, every other weather location, node = goleta200
+    all_weather = readRDS(here("outputs", "all_weather_r_08_w_656.rds"))
+
+    # read in weather file for radius = 0.8, first 656 weather files, every other weather location, node = goleta200
+    all_weather = readRDS(here("outputs", "all_weather_r_1_w_1095.rds"))
+
+```{r, Read-all_weather-if-built}
+# read in weather file for radius = 1.5, every other weather location, node = goleta200
+all_weather = readRDS(here("outputs", "all_weather_r_1_5_w_1095.rds"))
+```
+
+```{r, Build-Complete-Dataset}
+# filter for only LMP data
+goleta_lmps_only = goleta_lmps %>% 
+  filter(date %in% all_weather$date) %>% 
+  select(lmp, date) 
+# build dataset for modelling from LMP data + weather data (dates + hour should match)
+all_model_data = merge(goleta_lmps_only, all_weather) %>% 
+  # remove extreme outliers and missing data
+  filter(lmp < 200) %>% 
+  filter(lmp > -50) %>% 
+  na.exclude()
+# add prev_day_lmp variable, using yesterday's LMP to predict todays
+all_model_data = all_model_data %>%
+  mutate(prev_day_lmp = all_model_data$lmp[match(date - days(1), all_model_data$date)]) %>%
+  na.exclude()
+
+med_lmp = median(all_model_data$lmp)
+```
+
+## Data-Splitting and Cross-Validation
+
+The following code splits the data into a training and a testing set. This is because we want to test the predictive capability of our models: how well can they predict LMPs that they have never seen before? The models will all be trained on the testing data, and final performance will be considered using the testing data.
+
+Additionally, the training is "folded" three times, so that we can consider another layer of training and testing. When tuning our model parameters, each model will be trained on two of the folds, and its performance tested on the third, so as to avoid overfitting that might occur on the training data. Models that do overfit to the training data will perform worse on testing sets when being "cross-validated" and will not be selected.
+
+Due to the extremely large amount of data and significant model tun time, I chose to split the training set into only 3 folds instead of the more typical 5.
+
+```{r, split-and-fold}
+# split all_model_data into training, testing sets
+goleta_split <- initial_split(all_model_data %>% select(-date), prop = .8)
+goleta_train <- training(goleta_split)
+goleta_test <- testing(goleta_split)
+# generate folds from training data
+goleta_folds <- vfold_cv(goleta_train, v = 3)
+# build persistence dataset that is only yesterdays + todays LMP
+```
+
+# Exploratory Data Analysis
+
+## LMP EDA
+
+The mean LMP in our data set is \$`r med_lmp`. Figure 2a shows the distribution of LMPs. Note that I have filtered out extreme prices (LMPs \> \$2 and LMPs \< -\$50) as these exceptions are highly unpredictable and caused both the persistence model and my machine learning models to perform quite awfully. A future analysis should dive into understanding what external factors may cause LMPs to jump up to \>\$500 or drop below \$100, but for this analysis I will stick to trying to predict more typical prices.
+
+Figure 2b, showing mean LMPs for each hour of the day, is exactly what we expect. Prices dip during the middle of the day, when temperatures are warmer and variable generation (solar, wind) are at their maximum and then spike in the evening when people are at home consuming electricity and variable generation has dropped off. This effect was predicted in 2012 by CAISO and is called the "Duck Curve" (Figure 3).
+
+```{r, lmp-histogram-and-hourly}
+# visualize LMP data, removing outliers
+goleta_lmps_filtered = goleta_lmps_only %>%
+  filter(lmp < 200) %>% 
+  filter(lmp > -50)
+
+par(mfrow=c(1,2))
+
+lmp_hist = ggplot(goleta_lmps_filtered, aes(x = lmp))+
+  geom_histogram(bins = 25) + 
+  labs(x = "LMP [$]", y = "Count")
+
+hour_summary_full = goleta_lmps_filtered %>% 
+  group_by(hour = hour(date)) %>% 
+  summarize(mean_lmp = mean(lmp))
+
+lmp_hourly = ggplot(hour_summary_full, aes(x = hour, y = mean_lmp)) + 
+  geom_col(position = "dodge") + 
+  labs(x = "Hour", y = "Mean LMP [$]")
+
+ggarrange(lmp_hist, lmp_hourly, labels = c("Fig 2a", "Fig 2b"))
+
+median(all_model_data$lmp)
+```
+
+Figure 2a: LMP Histogram and 2b: LMP Hourly
+
+```{r}
+knitr::include_graphics(here("images", "duck_curve.png"))
+```
+
+Figure 3: CAISO's Duck Curve
+
+Source: <https://www.caiso.com/documents/flexibleresourceshelprenewables_fastfacts.pdf>
+
+## Weather EDA
+
+The complete weather dataset has a unique parameter for every combination of location and weather parameters, creating 1695 predictor variables. First, I'll perform EDA separately for just Weather Parameters, aggregating the spatial variation, looking for correlations between those 15 parameters. Then, I'll make maps to visualize mean spatial correlations. Lastly, I'll examine a complete correlation matrix of all 1695 predictors. 
+
+Here, I write a new function to read in weather files that does not convert locations to unique predictors.
+
+```{r, Read-Weather-Files-long}
+# create function to build dataframe from list of files paths, list of dates, and variable lists
+build_weather_data_frame_long = function(file_paths) {
+
+  # initialize complete weathere data frame
+  weather_data_frame = data.frame(matrix(nrow = 0, ncol = 8))
+  colnames(weather_data_frame) = c("value", "year", "month", "day", "hour", "parameter", "lat", "lon")
+  
+  # iterate through file paths provided
+  for (i in 1:length(file_paths)) {
+    # print which path code is on no check run speed
+    print(i)
+    flush.console()
+    # read in vectorized weather data from current file path
+    weather_list = c(pd$read_pickle(file_paths[i]))
+    date = ymd(str_sub(sub(".pkl", "", file_paths[i]), -8, -1))
+    # build new data frame of current weather data
+    current_weather = data.frame(
+      # values from current vectorized weather list
+      value = weather_list,
+      year = year(date),
+      month = month(date),
+      day = day(date),
+      # hour, parameter, lat, lon from previoiusly built iterative lists
+      hour = hours_list,
+      parameter = params_list,
+      lat = lat_list, 
+      lon = lon_list
+      ) %>% 
+      # skip every other land loc in both directions (25% of total locations)
+      filter((lat %% .25) == 0) %>% 
+      filter((lon %% .25) == 0) %>% 
+      # filter out weather data for locations w/ euclidean distance > radius specified above
+      filter( ((loc_goleta[1] - lat)^2 + (loc_goleta[2] - lon)^2)^(1/2) < radius) 
+      # expand data to include an individual covariate for each parameter at each location
+      #pivot_wider(names_from = c(parameter, lat, lon), values_from = value, names_sep = "//")
+    # append current weather data to complete data frame
+    weather_data_frame = rbind(weather_data_frame, current_weather) 
+  }
+  weather_data_frame = weather_data_frame %>% 
+      mutate(date = ymd_h(paste(year, month, day, hour))) %>% 
+      select(-c(year, month, day, hour))
+  # return data frame with weather from all files and dates provided
+  return(weather_data_frame)
+}
+```
+
+`{#r, build-365-day-weather-long-format} weather_1_100 = build_weather_data_frame_long(ac_weather_files[1:100]) weather_101_200 = build_weather_data_frame_long(ac_weather_files[101:200]) weather_201_300 = build_weather_data_frame_long(ac_weather_files[201:300]) weather_301_365 = build_weather_data_frame_long(ac_weather_files[301:365]) all_weather_long = rbind(weather_1_100, weather_101_200, weather_201_300, weather_301_365) # save weather as RDS file all_weather_r_"radius"_w_"number of weather days".rds saveRDS(all_weather_long, file = here("outputs", "all_weather_long_365.rds"))`
+
+```{r, load-365-day-weather-long-format}
+all_weather_long = readRDS(here("outputs", "all_weather_long_365.rds"))
+```
+
+```{r, pivot-wider-weather-long}
+all_weather_long_parameters = pivot_wider(all_weather_long, names_from = parameter, values_from = value) 
+only_weather = all_weather_long_parameters %>% 
+  select(-date, -lat, -lon)
+```
+
+### Weather Parameters EDA
+
+First, I'll plot a correlation matrix of all weather parameters.
+
+```{r}
+# build correlation matrix of numeric predictors, display as corrplot
+# consider generation as numeric predictor
+weather_cor = cor(only_weather)
+corrplot(weather_cor, method = "circle")
+```
+
+Figure 4: Weather Parameters Correlation Matrix
+
+A few key relationships jump out from the correlation plot above:
+
+1.  All Wind Speeds are strongly correlated (\>0.8) to each other, especially Wind Speed at 10m & 60m and Wind Speed at 80m, 100m, and 120m.
+2.  Wind Speeds are not strongly correlated to any other predictors
+3.  Temperature, Discomfort Index, Wind Chill, and Heating Cooling Degree Hours are all highly correlated (\>0.8) with each other, and slightly anti-correlated with Relative Humidity (\~0.4)
+4.  GSI is strongly correlated (\>0.6) to direct solar irradiance
+5.  Pressure, Dew Point, and Humidity are all loosely correlated
+
+It could be reasonable to merge highly-correlated variables, producing a single Avg Wind Speed, and simply using Temperature instead of Temperature, Discomfort Index, Wind Chill, and Heating Cooling Degree Hours. This would eliminate 7 parameters!
+
+### Spatial EDA
+
+After filtering, the weather nodes I am using in my models are \~17 miles apart. Thus we can expect very significant correlation between locations throughout a given day, however, this is a distance over which weather may change in one node before it changes in another (at the hourly timestep).
+
+I chose to make maps of Wind Speed at 60m, Direct Solar Irradiance, and Temperature, as these are the three parameters that I expect to be most predictive of Wind generation, Solar generation, and electricity consumption, respectively. As there are over 100 locations, it was not feasible to look at relationships individually. The following figures shown mean values for each location.
+
+```{r, spatial-summary}
+mean_spatial_summary = all_weather_long %>%
+  pivot_wider(names_from = parameter, values_from = value) %>% 
+  group_by(lon, lat) %>%
+  summarise(Mean_Wind_Speed = mean(WS_60m),
+            Mean_Direct_Solar_Irradiance = mean(DSWRF),
+            Mean_Temperature = mean(TMP_2m))
+```
+
+```{r, wind-map}
+mapview(mean_spatial_summary, xcol = "lon", ycol = "lat", zcol = "Mean_Wind_Speed", crs = 4269)
+```
+
+Figure 5a: Wind Map
+
+```{r, irrad-map}
+mapview(mean_spatial_summary, xcol = "lon", ycol = "lat", zcol = "Mean_Direct_Solar_Irradiance", crs = 4269)
+```
+
+Figure 5b: Direct Solar Irradiance Map
+
+```{r, temp-map}
+mapview(mean_spatial_summary, xcol = "lon", ycol = "lat", zcol = "Mean_Temperature", crs = 4269)
+```
+
+Figure 5c: Temperature Map
+
+We see typical weather patterns in the data: higher wind speeds offshore and higher temperatures and irradiance as we move inland.
+
+### All Parameters EDA
+
+While making a corrplot of all 1695 predictors wouldn't be feasible, I made a correlation matrix, filtered out values on the prime diagonal (which are all equal to 1 as they are showing the correlation between a given predictor and itself), and then counted how many values in the matrix were equal to 1. 
+
+```{r}
+# correlation matrix for entire testing set
+train_cor = cor(goleta_train)
+# filter out prime diag
+for (i in 1:sqrt(length(train_cor))) {
+  train_cor[i,i] = 0
+}
+train_cor_df = data.frame(train_cor) 
+perfectly_corr = matrix(nrow = 0, ncol = 2)
+perfectly_corr = data.frame(perfectly_corr)
+colnames(perfectly_corr) = c("Param1", "Param2")
+# build df of perfectly correlated predictors
+for (i in 1:sqrt(length(train_cor))) {
+  for (j in 1:sqrt(length(train_cor))) {
+    if (train_cor_df[i,j] == 1) {
+      new_perf = c(row.names(train_cor_df)[i], colnames(train_cor_df)[j])
+      perfectly_corr = rbind(perfectly_corr, new_perf)
+    }
+  }
+}
+```
+
+There were 554 values in the matrix equal to 1, implying 277 instances of perfectly correlated predictors, as the matrix is mirrored. There were 0 instances of perfectly anti-correlated predictors. I then gathered all pairs of perfectly correlated predictors into a dataframe. In examining the predictors, I noticed that all perfect correlations fell into one of two categories:
+
+1. Temperature (TMP_2m) and Heating Cooling Degree Hour (HCDH_2m) at a shared location
+2. GSI at neighboring locations
+
+As simple linear regressions will fail with perfectly correlated predictors, I decided to run two seperate ensembles of models:
+
+1. Using all 15 predictor variables
+2. Using only 7 predicors, having removed those that had perfect correlations in the data or were very strongly correlated (>0.9) to other parameters. This second dataset included only: 
+
+| Parameter                        | ID      | Unit          |
+|----------------------------------|---------|---------------|
+| Pressure                         | PRES    | pa            |
+| Direct Solar Irradiance          | DSWRF   | W/m2          |
+| Diffuse Solar Irradiance         | DLWRF   | W/m2          |
+| Dew Point (2m)                   | DPT_2m  | K             |
+| Relative Humidity (2m)           | RH_2m   | \%            |
+| Temperature (2m)                 | TMP_2m  | K             |
+| Wind Speed (80m)                 | WS_80m  | m/s           |
+
+I chose to use Wind Speed at 80m as it was closest to a median value. 
+
+```{r}
+# select all predictors - GSI, HCDH
+all_model_data_2 = all_model_data %>% 
+  select(-date) %>% 
+  select(-starts_with("GSI")) %>% 
+  select(-starts_with("HCDH"))%>% 
+  select(-starts_with("DI"))%>% 
+  select(-starts_with("WC"))%>% 
+  select(-starts_with("WS_10"))%>% 
+  select(-starts_with("WS_60"))%>% 
+  select(-starts_with("WS_100"))%>% 
+  select(-starts_with("WS_120"))
+# check correlations, should be 0
+cor_2 = cor(all_model_data_2)
+for (i in 1:sqrt(length(cor_2))) {
+  cor_2[i,i] = 0
+}
+sum(cor_2 == 1)
+```
+
+As expected, the new data set has 0 perfectly correlated predictors! This dataset includes the same 25,258 observations, but only 793 predictor variables (7 parameters, 113 locations).
+
+The modeling for this data set will take place in _Machine Learning Models Part 2_
+
+
+
+# Machine Learning Models
+
+I considered four types of models, with tuning parameters: *simple linear regression*, *tuned regularized regression*, *random forest regression*, and *boosted tree regression*. Table 2 summarizes the parameters being tuned for each model.
+
++--------------------------+-----------------------------------------------------------------------------------------------+
+| Model                    | Tuning Parameters                                                                             |
++==========================+===============================================================================================+
+| Simple Linear Regression | None                                                                                          |
++--------------------------+-----------------------------------------------------------------------------------------------+
+| Regularized Regression   | -   **penalty**: how much the model performance is punished for each additional parameters    |
+|                          |                                                                                               |
+|                          | -   **mixture**: the ratio of Ridge to Lasso regularization                                   |
++--------------------------+-----------------------------------------------------------------------------------------------+
+| Random Forest            | -   **mtry:** the number of predictors that will be sampled at each split when building trees |
+|                          |                                                                                               |
+|                          | -   **trees:** total number of trees in the random forest                                     |
+|                          |                                                                                               |
+|                          | -   **min_n:** smallest allowable node size                                                   |
++--------------------------+-----------------------------------------------------------------------------------------------+
+| Boosted Tree             | -   **trees:** total number of trees                                                          |
++--------------------------+-----------------------------------------------------------------------------------------------+
+
+: Table 2: Models and Tuning Parameters
+
+### Persistence Model
+
+A simple model that predicts each LMP as the LMP of the previous day at the same hour.
+
+```{r, persistence-model}
+goleta_persistence = goleta_train %>% 
+  select(lmp, prev_day_lmp)
+# calculate R2 of persistence model
+goleta_persistence_rmse = metric_set(rmse)
+goleta_persistence_rmse = goleta_persistence_rmse(goleta_persistence, truth = lmp, 
+                estimate = prev_day_lmp)
+
+```
+
+The persistence model has an RMSE of `r round(goleta_persistence_rmse$.estimate,2)` when applied to the training dataset. We will use this when calculating the forecasting skill of our other models.
+
+### Create Model Recipe
+
+A simple recipe, modeling LMP as a function of all predictors. Predictors are centered and scaled.
+
+```{r, model-recipe}
+# generate recipe to predict LMP
+goleta_recipe <- recipe(lmp ~ ., data = goleta_train) %>% 
+  # center and scale predictors
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors())
+```
+
+### Simple Linear Regression
+
+A classical linear regression, included to demonstrate how such a model will run astray when trying to model data with highly correlated predictors and many parameters relative to the total number of observations.
+
+1 model
+
+```{r, simple-linear-reg}
+goleta_lm_model <- linear_reg() %>% 
+  set_engine("lm")
+
+goleta_lm_wflow <- workflow() %>% 
+  add_model(goleta_lm_model) %>% 
+  add_recipe(goleta_recipe)
+
+goleta_lm_fit <- fit(goleta_lm_wflow, goleta_train)
+
+goleta_train_res <- predict(goleta_lm_fit, new_data = goleta_train %>% select(-lmp))
+goleta_train_res <- bind_cols(goleta_train_res, goleta_train %>% select(lmp))
+goleta_lm_rmse = rmse(goleta_train_res, truth = lmp, estimate = .pred)
+```
+
+### Regularization Model tuning *penalty*, *mixture*
+
+A regularized regression model finding the best values for penalty and mixture.
+
+3 folds x 10 penalties x 6 mixtures = 180 models fit
+
+```{r, regulariziation-model}
+# set up model tuning penalty, mixture
+goleta_reg_model <- linear_reg(penalty = tune(), mixture = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("glmnet")
+# build grid of tuning values
+goleta_reg_grid <- grid_regular(penalty(range = c(0, 2)), mixture(range = c(0, 0.25)), levels = c(penalty = 10, mixture = 6))
+# set up workflow with tuning model
+goleta_reg_wf <- workflow() %>% 
+  add_model(goleta_reg_model) %>% 
+  add_recipe(goleta_recipe)
+```
+
+```{#r}
+# tune models with folds, grid 5*10*6 = 300 models total
+goleta_tune_regularization <- tune_grid(
+  goleta_reg_wf,
+  resamples = goleta_folds, 
+  grid = goleta_reg_grid
+)
+# save goleta_tune_regularization
+saveRDS(goleta_tune_regularization, file = here("outputs", "goleta_tune_regularization.rds"))
+```
+
+```{r}
+goleta_tune_regularization = readRDS(file = here("outputs", "goleta_tune_regularization.rds"))
+```
+
+```{r}
+# display model results
+autoplot(goleta_tune_regularization)
+
+goleta_reg_metrics = collect_metrics(goleta_tune_regularization) %>% filter(.metric == "rmse") %>% arrange(mean)
+
+goleta_reg_best_rmse = goleta_reg_metrics$mean[1]
+
+goleta_reg_best_params <- select_best(goleta_tune_regularization, metric = "rmse")
+```
+
+### Random Forest Model tuning *mtry*, *trees*, *min_n* (3 folds x 1 mtry x 1 trees x 1 min_n = 3 models total)
+
+A random forest regression model finding the best values for mtry, trees, and min_n.
+
+I was unable to run the tuned random forest fit that I was hoping to, with mtry in [10, 100], trees in [100, 1000], and min_n in [5, 50]. This, however, would have taken over 36 hours to exectue (I halted the fitting after the 36 hours). Instead, I fit a range of models for smaller values of mtry, trees, and min_n to spot trends, and then ran individual models for larger values. The trends I noticed for the smaller values were:
+
+1.  models with more predictors performed better
+2.  models with more trees performed better
+3.  models with a smaller minimum node size performed better
+
+I then expanded on these trends, reaching this final model. This model performed best of all random forests I tested, and took \~1.5 hours to run by itself.
+
+```{r, random-forest}
+goleta_forest_model <- rand_forest(mtry = tune(), trees = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+
+goleta_forest_wf = workflow() %>% 
+  add_model(goleta_forest_model) %>% 
+  add_recipe(goleta_recipe)
+
+goleta_param_grid_forest <- grid_regular(mtry(range = c(75,75)), trees(range = c(750,750)), min_n(range = c(10,10)), levels = c(mtry = 1, trees = 1, min_n = 1))
+```
+
+```{#r}
+goleta_tune_res_forest <- tune_grid(
+  goleta_forest_wf, 
+  resamples = goleta_folds, 
+  grid = goleta_param_grid_forest, 
+  metrics = metric_set(rmse)
+)
+
+saveRDS(goleta_tune_res_forest, file = here("outputs", "goleta_tune_res_forest.rds"))
+```
+
+
+```{r}
+goleta_tune_res_forest = readRDS(file = here("outputs", "goleta_tune_res_forest.rds"))
+```
+
+```{r}
+goleta_forest_metrics = collect_metrics(goleta_tune_res_forest, metric = "rmse") %>% arrange(mean)
+
+goleta_forest_best_rmse = goleta_forest_metrics$mean[1]
+
+goleta_forest_best_params <- select_best(goleta_tune_res_forest, metric = "rmse")
+```
+
+### Boosted Tree Model tuning *trees* (3 folds x 10 trees = 30 models total)
+
+3 folds x 5 trees = 15 models fit (2.5 hours)
+
+```{r, boosted-tree}
+goleta_boost_model <- boost_tree(trees = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+goleta_boost_wf = workflow() %>% 
+  add_model(goleta_boost_model) %>% 
+  add_recipe(goleta_recipe)
+
+goleta_param_grid_boost <- grid_regular(trees(range = c(100, 500)), levels = 5)
+```
+
+```{#r}
+goleta_tune_res_boost <- tune_grid(
+  goleta_boost_wf, 
+  resamples = goleta_folds, 
+  grid = goleta_param_grid_boost, 
+  metrics = metric_set(rmse)
+)
+
+saveRDS(goleta_tune_res_boost, file = here("outputs", "goleta_tune_res_boost.rds"))
+```
+
+
+```{r}
+goleta_tune_res_boost = readRDS(file = here("outputs", "goleta_tune_res_boost.rds"))
+```
+
+```{r}
+autoplot(goleta_tune_res_boost)
+
+goleta_boost_metrics = collect_metrics(goleta_tune_res_boost) %>% arrange(mean)
+
+goleta_boost_best_rmse = goleta_boost_metrics$mean[1]
+
+goleta_boost_best_params <- select_best(goleta_tune_res_boost, metric = "rmse")
+```
+
+## RMSE and Forecasting Skill of Best Models
+
+```{#r, disp-rmse-of-all-models}
+disp_tbl = matrix(nrow = 4, ncol = 2)
+disp_tbl = data.frame(disp_tbl)   
+colnames(disp_tbl) = c("Model", "RMSE")
+disp_tbl[1:4, 1] = c("Simple Linear Regression", "Tuned Regularization", "Tuned Random Forest", "Tuned Boosted Tree")
+disp_tbl[1:4, 2] = c(goleta_lm_rmse$.estimate, goleta_reg_best_rmse, goleta_forest_best_rmse, goleta_boost_best_rmse)
+disp_tbl = disp_tbl %>% 
+  mutate(Metric = 1 - RMSE/goleta_persistence_rmse$.estimate)
+disp_tbl
+
+saveRDS(disp_tbl, file = here("outputs", "disp_tbl.rds"))
+```
+
+```{r}
+disp_tbl = readRDS(file = here("outputs", "disp_tbl.rds"))
+disp_tbl
+```
+
+Table 3: RMSE and Forecasting Skill for Best Model of Each Type
+
+### Fit Best Model to Training Data and Test Performance on Testing Data
+
+The best model was the Boosted Tree with 500 Trees (RMSE = 12.8, Forecasting Skill = .22). The challenge with Tree-based models and analyses like this, is that decision Trees build relationships between predictor variables to make their estimates. Trying to run such an algorithm on a model with 1695 predictors (after filtering out \~100,000) will very quickly run into time and memory constraints. For this reason, I am surprised that the Tree-based models performed as well as they did. I was happy to see that the RMSE was beginning to level off for 500 Trees, as this looks to imply that adding more trees wouldn't significantly improve the model.
+
+The best model is now fit to the entire training dataset, and its performance tested on the testing data set, which it has not yet seen.
+
+```{r, select-best-and-train-and-test}
+best_model = disp_tbl$Model[match(min(disp_tbl$RMSE), disp_tbl$RMSE)]
+if (best_model == "Tuned Regularization") {
+  # finalize workflow and fit to training data
+  goleta_final_wflow <- finalize_workflow(goleta_reg_wf, goleta_reg_best_params)
+} else if (best_model == "Tuned Random Forest") {
+  goleta_final_wflow <- finalize_workflow(goleta_forest_wf, goleta_forest_best_params)
+} else if (best_model == "Tuned Boosted Tree") {
+  goleta_final_wflow <- finalize_workflow(goleta_boost_wf, goleta_boost_best_params)
+} else {
+  goleta_final_wflow = NA
+}
+```
+
+```{#r}
+goleta_final_fit <- fit(goleta_final_wflow, data = goleta_train)
+
+saveRDS(goleta_final_fit, file = here("outputs", "goleta_final_fit.rds"))
+```
+
+```{r}
+goleta_final_fit = readRDS(file = here("outputs", "goleta_final_fit.rds"))
+```
+
+```{r, persistence-testing-model}
+goleta_test_persistence = goleta_test %>% 
+  select(lmp, prev_day_lmp)
+# calculate R2 of persistence model
+goleta_test_persistence_rmse = metric_set(rmse)
+goleta_test_persistence_rmse = goleta_test_persistence_rmse(goleta_test_persistence, truth = lmp, 
+                estimate = prev_day_lmp)
+
+```
+
+```{r}
+  # calculate R2 of final fitted model on testing data
+test_fit = augment(goleta_final_fit, new_data = goleta_test)
+test_rmse = augment(goleta_final_fit, new_data = goleta_test) %>%
+  rmse(truth = lmp, estimate = .pred)
+test_metric = 1-test_rmse$.estimate/goleta_test_persistence_rmse$.estimate
+```
+
+
+
+# Machine Learning Models Part 2
+
+First, I create new training, testing, and folds datasets, as well as a new recipe using the limited list of predictors. 
+
+```{r, split-and-fold-2}
+# split all_model_data into training, testing sets
+goleta_split_2 <- initial_split(all_model_data_2, prop = .8)
+goleta_train_2 <- training(goleta_split_2)
+goleta_test_2 <- testing(goleta_split_2)
+# generate folds from training data
+goleta_folds_2 <- vfold_cv(goleta_train_2, v = 3)
+# generate recipe to predict LMP
+goleta_recipe_2 <- recipe(lmp ~ ., data = goleta_train_2) %>% 
+  # center and scale predictors
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors())
+```
+
+### Simple Linear Regression Part 2
+
+A classical linear regression, with no perfectly correlated predictors, and all closely correlated predictors removed. 
+
+1 model
+
+```{r, simple-linear-reg-2}
+goleta_lm_wflow_2 <- workflow() %>% 
+  add_model(goleta_lm_model) %>% 
+  add_recipe(goleta_recipe_2)
+
+goleta_lm_fit_2 <- fit(goleta_lm_wflow_2, goleta_train_2)
+
+goleta_train_res_2 <- predict(goleta_lm_fit_2, new_data = goleta_train_2 %>% select(-lmp))
+goleta_train_res_2 <- bind_cols(goleta_train_res_2, goleta_train_2 %>% select(lmp))
+goleta_lm_rmse_2 = rmse(goleta_train_res_2, truth = lmp, estimate = .pred)
+goleta_lm_fs_2 = 1-goleta_lm_rmse_2$.estimate/goleta_persistence_rmse$.estimate
+```
+
+This new Simple Linear Regression has an RMSE of `r goleta_lm_rmse_2$.estimate`, giving it a forecasting skill of `r goleta_lm_fs_2`, outperforming the regularization model and nearly performing as well as the random forest (both using all model data)!
+
+I'll now test the performance of the Regularization, Random Forest, and Boosted Tree models on the limited dataset. Models should run much faster as there are less than half as many predictors, giving far fewer options for relationships between nodes.
+
+### Regularization Model Part 2: tuning *penalty*, *mixture*
+
+A regularized regression model finding the best values for penalty and mixture.
+
+3 folds x 10 penalties x 6 mixtures = 180 models fit
+
+```{r, regulariziation-model-2}
+# build grid of tuning values
+goleta_reg_grid_2 <- grid_regular(penalty(range = c(0, 4)), mixture(range = c(0, 0.5)), levels = c(penalty = 10, mixture = 6))
+# set up workflow with tuning model
+goleta_reg_wf_2 <- workflow() %>% 
+  add_model(goleta_reg_model) %>% 
+  add_recipe(goleta_recipe_2)
+```
+
+```{#r}
+# tune models with folds, grid 5*10*6 = 300 models total
+goleta_tune_regularization_2 <- tune_grid(
+  goleta_reg_wf_2,
+  resamples = goleta_folds_2, 
+  grid = goleta_reg_grid_2
+)
+# save goleta_tune_regularization
+saveRDS(goleta_tune_regularization_2, file = here("outputs", "goleta_tune_regularization_2.rds"))
+```
+
+```{r}
+goleta_tune_regularization_2 = readRDS(file = here("outputs", "goleta_tune_regularization_2.rds"))
+```
+
+```{r}
+# display model results
+autoplot(goleta_tune_regularization_2)
+
+goleta_reg_metrics_2 = collect_metrics(goleta_tune_regularization_2) %>% filter(.metric == "rmse") %>% arrange(mean)
+
+goleta_reg_best_rmse_2 = goleta_reg_metrics_2$mean[1]
+
+goleta_reg_best_params_2 <- select_best(goleta_tune_regularization_2, metric = "rmse")
+```
+
+### Random Forest Part 2
+
+```{r, random-forest-2}
+goleta_forest_wf_2 = workflow() %>% 
+  add_model(goleta_forest_model) %>% 
+  add_recipe(goleta_recipe_2)
+
+goleta_param_grid_forest_2 <- grid_regular(mtry(range = c(50, 100)), trees(range = c(600,1000)), min_n(range = c(10,10)), levels = c(mtry = 1, trees = 1, min_n = 1))
+```
+
+```{#r}
+goleta_tune_res_forest_2 <- tune_grid(
+      goleta_forest_wf_2,
+      resamples = goleta_folds_2,
+      grid = goleta_param_grid_forest_2,
+      metrics = metric_set(rmse)
+    )
+
+saveRDS(goleta_tune_res_forest_2, file = here("outputs", "goleta_tune_res_forest_2.rds"))
+```
+
+```{r}
+goleta_tune_res_forest_2 = readRDS(file = here("outputs", "goleta_tune_res_forest_2.rds"))
+```
+
+```{r}
+goleta_forest_metrics_2 = collect_metrics(goleta_tune_res_forest_2, metric = "rmse") %>% arrange(mean)
+
+goleta_forest_best_rmse_2 = goleta_forest_metrics_2$mean[1]
+
+goleta_forest_best_params_2 <- select_best(goleta_tune_res_forest_2, metric = "rmse")
+```
+
+### Boosted Tree Model tuning *trees* (3 folds x 10 trees = 30 models total)
+
+3 folds x 5 trees = 15 models fit (2.5 hours)
+
+```{r, boosted-tree-2}
+goleta_boost_wf_2 = workflow() %>% 
+  add_model(goleta_boost_model) %>% 
+  add_recipe(goleta_recipe_2)
+
+goleta_param_grid_boost_2 <- grid_regular(trees(range = c(600, 600)), levels = 1)
+```
+
+```{#r}
+goleta_tune_res_boost_2 <- tune_grid(
+  goleta_boost_wf_2, 
+  resamples = goleta_folds_2, 
+  grid = goleta_param_grid_boost_2, 
+  metrics = metric_set(rmse)
+)
+
+saveRDS(goleta_tune_res_boost_2, file = here("outputs", "goleta_tune_res_boost_2.rds"))
+```
+
+```{r}
+goleta_tune_res_boost_2 = readRDS(file = here("outputs", "goleta_tune_res_boost_2.rds"))
+```
+
+```{r}
+goleta_boost_metrics_2 = collect_metrics(goleta_tune_res_boost_2) %>% arrange(mean)
+
+goleta_boost_best_rmse_2 = goleta_boost_metrics_2$mean[1]
+
+goleta_boost_best_params_2 <- select_best(goleta_tune_res_boost_2, metric = "rmse")
+```
+
+## RMSE and Forecasting Skill of Best Models
+
+```{r, disp-rmse-of-all-models-2}
+disp_tbl_2 = matrix(nrow = 4, ncol = 2)
+disp_tbl_2 = data.frame(disp_tbl_2)   
+colnames(disp_tbl_2) = c("Model", "RMSE")
+disp_tbl_2[1:4, 1] = c("Simple Linear Regression", "Tuned Regularization", "Tuned Random Forest", "Tuned Boosted Tree")
+disp_tbl_2[1:4, 2] = c(goleta_lm_rmse_2$.estimate, goleta_reg_best_rmse_2, goleta_forest_best_rmse_2, goleta_boost_best_rmse_2)
+
+disp_tbl_2 = disp_tbl_2 %>% 
+  mutate(Metric = 1 - RMSE/goleta_persistence_rmse$.estimate)
+
+disp_tbl_2
+
+saveRDS(disp_tbl_2, file = here("outputs", "disp_tbl_2.rds"))
+```
+
+```{#r}
+disp_tbl_2 = readRDS(file = here("outputs", "disp_tbl_2.rds"))
+disp_tbl_2
+```
+
+Table 3: RMSE and Forecasting Skill for Best Model of Each Type
+
+### Fit Best Model to Training Data and Test Performance on Testing Data
+
+--edit this text start--
+
+The best model was the Boosted Tree with 500 Trees (RMSE = 12.8, Forecasting Skill = .22). The challenge with Tree-based models and analyses like this, is that decision Trees build relationships between predictor variables to make their estimates. Trying to run such an algorithm on a model with 1695 predictors (after filtering out \~100,000) will very quickly run into time and memory constraints. For this reason, I am surprised that the Tree-based models performed as well as they did. I was happy to see that the RMSE was beginning to level off for 500 Trees, as this looks to imply that adding more trees wouldn't significantly improve the model.
+
+--edit this text end--
+
+The best model is now fit to the entire training dataset, and its performance tested on the testing data set, which it has not yet seen.
+
+```{r, select-best-and-train-and-test-2}
+best_model_2 = disp_tbl_2$Model[match(min(disp_tbl_2$RMSE), disp_tbl_2$RMSE)]
+if (best_model_2 == "Tuned Regularization") {
+  # finalize workflow and fit to training data
+  goleta_final_wflow_2 <- finalize_workflow(goleta_reg_wf_2, goleta_reg_best_params_2)
+} else if (best_model_2 == "Tuned Random Forest") {
+  goleta_final_wflow_2 <- finalize_workflow(goleta_forest_wf_2, goleta_forest_best_params_2)
+} else if (best_model_2 == "Tuned Boosted Tree") {
+  goleta_final_wflow_2 <- finalize_workflow(goleta_boost_wf_2, goleta_boost_best_params_2)
+} else {
+  goleta_final_wflow_2 = goleta_lm_wflow_2
+}
+```
+
+```{#r}
+goleta_final_fit_2 <- fit(goleta_final_wflow_2, data = goleta_train_2)
+
+saveRDS(goleta_final_fit_2, file = here("outputs", "goleta_final_fit_2.rds"))
+```
+
+```{r}
+goleta_final_fit_2 = readRDS(file = here("outputs", "goleta_final_fit_2.rds"))
+```
+
+```{r}
+  # calculate R2 of final fitted model on testing data
+test_fit_2 = augment(goleta_final_fit_2, new_data = goleta_test_2)
+test_rmse_2 = augment(goleta_final_fit_2, new_data = goleta_test_2) %>%
+  rmse(truth = lmp, estimate = .pred)
+test_metric_2 = 1-test_rmse_2$.estimate/goleta_test_persistence_rmse$.estimate
+```
+
+
+# Conclusion
+
+## Model Performance
+
+### Part 1: All Predictors
+
+First, I'll discuss the performance of the models fit to the entire data set. The persistence model, against which other models are being compared, had an RMSE of `r goleta_persistence_rmse$.estimate`  on the training data and an RMSE of `r round(goleta_test_persistence_rmse$.estimate,2)` on the testing data.
+
+As expected, the simple linear regression failed completely, with an infinite error. This was due to the perfection correlation between predictors we discussed earlier. 
+
+The best regularization models had low penalties and were 100% ridge regression. This is as close as a regularized regression can get to simple linear regression, so I expect the simple linear regression with limited parameters to outperform this model. I expect that the regularization models would perform better if I was able to include all locations, as then a LASSO could be used for variable selection, and tree-based models would take too long to run and simple linear regression would not converge if p>n. 
+
+The random forest performed best with more trees and more considered parameters. The primary constraint on this was time and memory, as I couldn't run the random forest for more than 600 trees within a reasonable amount of time. I think this model may perform better as well with less parameters as I can increase the number of predictors included and trees.
+
+The best model was a boosted tree with 500 trees. It had an RMSE of `r goleta_boost_best_rmse` and a forecasting skill of `r 1-goleta_boost_best_rmse/goleta_test_persistence_rmse$.estimate`. The model performed better as trees were added, however, it appeared as though it was beginning to reach an asymptote at trees = 500, so it likely would not have performed significantly better for more trees. I'm curious how this model will perform when remove predictors but can boost the number of trees. 
+
+### Part 2: Only Non-Correlated Predictors
+
+The best regularized model now performed worst than the simple linear regression, implying that imparting a penalty for variable inclusion is not necessary in this analysis. Again, the best model had the lowest penalty and was 100% ridge. 
+
+After eliminating perfectly correlated predictors, the simple linear regressions performed very well, with an RMSE of `r goleta_lm_rmse_2$.estimate`, a big step up from Infinite error! This regression had a forecassting skill of `r goleta_lm_fs_2`, and performed better than I expected a simple regression would on such complex data! To be fair, however, it took significant EDA and variable selection to get to this point.
+
+The random forest improved after variable selection, with an RMSE of `r goleta_forest_best_rmse_2`, nearly beating the best boosted tree with all predictors. I'm guessing this improvement is due to my being able to include more relationships and trees, without losing any valuable data in the closely correlated predictors. 
+
+The boosted tree again performed best, with a best RMSE of `r goleta_boost_best_rmse_2` and a forecasting skill of `r 1-goleta_boost_best_rmse_2/goleta_test_persistence_rmse$.estimate`. This boosted tree included 600 trees. It significantly outperformed the persistence model, which I'm very excited about!
+
+### Best Models fit to Entire Training Data
+
+The best models from Part 1 and Part 2 were then fit to the entire training and testing data sets. Interestingly, while the Part 2 Boosted Tree Model outperformed the Part 1 Boosted Tree Model (RMSE `r goleta_boost_best_rmse_2` vs `r goleta_boost_best_rmse`) during cross validation, the Part 1 Boosted Tree (Using all predictors rather then the subset) performed better when trained on the entire training set and performance tested on the entire testing set. This could be due to the fact that I only cross-validated on k=3 folds, instead of the more typical k=5 or k=10. In future analyses I plan on switching to k=5 to hopefully remedy this issue.
+
+Thus, the best model of all was the Boosted Tree (Trees = 500) using all 15 predictor variables. The final model had an RMSE of `r test_rmse$.estimate` and a forecasting skill of `r test_metric`.
+
+It should be noted, however, that this current model is using *actual* weather data, when really we should be using day-ahead *forecasts*, as this is what the algorithm will have when working in real-time to predict LMPs. This will not impact the persistence RMSE, but will assuredly impact the model RMSEs, reducing the forecasting skill.
+
+## Future Work
+
+I plan on continuing with this analysis. My next steps are:
+
+1. Switching to weather forecast instead of actual weather data
+2. Cross-validating the _radius_ parameter to determine an optimal radius. I excluded this from the current analyses as it will take some code restructuring to do this, as currently an entirely new dataset is pulled from BOX for a given radius.
+3. Including all weather and location parameters in R for an initial LASSO. This will mean figuring out a work around for the space and memory issues I initially ran into.
+4. After running the LASSO on all parameters, using the selected parameters within a boosted tree and random forest. I hope that the LASSO will select <100 parameters, so I can execute much larger numbers of Trees.
+5. Expand the analysis to all nodes in California! Eventually my goal is to have a complete LMP forecaster for the state, that projects node prices 24 hours in advance. 
+6. Parameter interpretation, I hope that a LASSO on all location and weather parameters will yield causal insights into drivers of electricity price changes.
+7. Inclusion and prediction of outliers, as I mentioned previously, sometimes prices spike and drop dramatically. Included these into the model will present a significant challenge, but may as well provide interesting insights. 
+
